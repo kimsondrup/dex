@@ -134,16 +134,32 @@ func ClaimsFromIdentity(identity connector.Identity) storage.Claims {
 	}
 }
 
+// errIdentityNotResolved is returned by the update callback when it needs a
+// fresh identity that was not resolved before the transaction was opened. It
+// never escapes Rotate.
+var errIdentityNotResolved = errors.New("refresh: identity not resolved")
+
 // Rotate advances the stored refresh token according to the rotation strategy and
 // syncs the offline session. It returns the marshaled token to hand back to the
 // client and the identity its claims were refreshed to.
 //
-// freshIdentity supplies the up-to-date identity. It is invoked inside the
-// storage transaction, and only when a token is actually minted, so the upstream
-// connector is contacted at most once even under concurrent refreshes.
+// freshIdentity supplies the up-to-date identity. It is invoked outside the
+// storage transaction, and only when a token is actually minted.
+//
+// Outside is load-bearing. Storage backends serve transactions from a connection
+// pool, and a connector may read storage - the built-in local connector reads the
+// password table - so calling one from inside the transaction asks the pool for a
+// second connection while the transaction holds the first. On a single-connection
+// backend that never resolves, and no acquisition timeout exists to break it.
+// It also holds a transaction open across a call to a remote identity provider.
+//
+// Whether an identity is needed depends on the token as stored, so it is decided
+// here from the token as last read, then re-checked inside the transaction. The
+// check only becomes more permissive as a concurrent refresh advances last-used,
+// so a stale decision costs at most one unnecessary connector call; the reverse
+// case, where the transaction needs an identity this did not fetch, is reported
+// back and retried once.
 func (rt *RefreshStore) Rotate(ctx context.Context, storageToken *storage.RefreshToken, requestToken *internal.RefreshToken, strategy *RefreshStrategy, freshIdentity func(context.Context) (connector.Identity, error)) (string, connector.Identity, error) {
-	var idErr error
-
 	newToken := &internal.RefreshToken{
 		Token:     requestToken.Token,
 		RefreshId: requestToken.RefreshId,
@@ -151,6 +167,22 @@ func (rt *RefreshStore) Rotate(ctx context.Context, storageToken *storage.Refres
 
 	lastUsed := rt.now()
 	ident := IdentityFromClaims(storageToken.Claims)
+
+	var fresh *connector.Identity
+	resolve := func() error {
+		id, err := freshIdentity(ctx)
+		if err != nil {
+			return err
+		}
+		fresh, ident = &id, id
+		return nil
+	}
+
+	if !strategy.AllowedToReuse(storageToken.LastUsed) {
+		if err := resolve(); err != nil {
+			return "", ident, err
+		}
+	}
 
 	refreshTokenUpdater := func(old storage.RefreshToken) (storage.RefreshToken, error) {
 		rotationEnabled := strategy.RotationEnabled()
@@ -193,22 +225,32 @@ func (rt *RefreshStore) Rotate(ctx context.Context, storageToken *storage.Refres
 		// ConnectorData has been moved to the offline session.
 		old.ConnectorData = nil
 
-		ident, idErr = freshIdentity(ctx)
-		if idErr != nil {
-			return old, idErr
+		// The token is being minted but last-used moved on after the decision
+		// above, so no identity was fetched. Ask for a retry rather than
+		// contacting the connector from in here.
+		if fresh == nil {
+			return old, errIdentityNotResolved
 		}
 
 		// Refresh the stored claims. UserID intentionally left untouched.
-		old.Claims.Username = ident.Username
-		old.Claims.PreferredUsername = ident.PreferredUsername
-		old.Claims.Email = ident.Email
-		old.Claims.EmailVerified = ident.EmailVerified
-		old.Claims.Groups = ident.Groups
+		old.Claims.Username = fresh.Username
+		old.Claims.PreferredUsername = fresh.PreferredUsername
+		old.Claims.Email = fresh.Email
+		old.Claims.EmailVerified = fresh.EmailVerified
+		old.Claims.Groups = fresh.Groups
 
 		return old, nil
 	}
 
-	if err := rt.storage.UpdateRefreshToken(ctx, storageToken.ID, refreshTokenUpdater); err != nil {
+	err := rt.storage.UpdateRefreshToken(ctx, storageToken.ID, refreshTokenUpdater)
+	if errors.Is(err, errIdentityNotResolved) {
+		// The transaction rolled back and changed nothing, so retrying is safe.
+		if err := resolve(); err != nil {
+			return "", ident, err
+		}
+		err = rt.storage.UpdateRefreshToken(ctx, storageToken.ID, refreshTokenUpdater)
+	}
+	if err != nil {
 		rt.logger.ErrorContext(ctx, "failed to update refresh token", "err", err)
 		return "", ident, err
 	}

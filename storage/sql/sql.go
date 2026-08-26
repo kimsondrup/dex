@@ -167,8 +167,13 @@ func (c *conn) ExecTx(fn func(tx *trans) error) error {
 	if err != nil {
 		return err
 	}
+	// Rollback on the way out, as the Postgres flavor above already does: after
+	// a successful Commit this is a no-op returning sql.ErrTxDone, but without
+	// it a callback that panics leaves the transaction open and its connection
+	// checked out for good.
+	defer sqlTx.Rollback()
+
 	if err := fn(&trans{sqlTx, c}); err != nil {
-		sqlTx.Rollback()
 		return err
 	}
 	return sqlTx.Commit()
